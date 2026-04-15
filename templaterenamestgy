@@ -1,0 +1,30 @@
+
+package org.Amkor.qovor.impl;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+
+public class TemplateRenameStrategy {
+    private final String template;
+
+    public TemplateRenameStrategy(String template) {
+        this.template = (template == null || template.isBlank()) ? "${original}" : template;
+    }
+
+    public String toTargetName(String originalFileName) {
+        String name = template.replace("${original}", originalFileName);
+        Pattern p = Pattern.compile("\\$\\{date:([^}]+)}");
+        Matcher m = p.matcher(name);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String fmt = m.group(1);
+            String v = LocalDateTime.now().format(DateTimeFormatter.ofPattern(fmt));
+            m.appendReplacement(sb, Matcher.quoteReplacement(v));
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+}
