@@ -1,0 +1,122 @@
+package org.Amkor.qovor.impl;
+
+
+import com.jcraft.jsch.*;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Properties;
+
+
+
+public class SftpUploader implements AutoCloseable {
+
+    /** Cấu hình SFTP */
+    public static class SftpConfig {
+        public String host;
+        public int port = 22;
+        public String username;
+        public String password = "";
+        public String privateKeyPath = "";
+        public String privateKeyPassphrase = "";
+        public int connectTimeoutMs = 15000;
+        public boolean strictHostKeyChecking = false;
+        public String knownHostsPath = "";
+    }
+
+    private final SftpConfig cfg;
+    private Session session;
+    private ChannelSftp sftp;
+
+    public SftpUploader(SftpConfig cfg) {
+        this.cfg = cfg;
+    }
+
+    /** Kết nối khi cần */
+    private synchronized void connectIfNeeded() throws IOException {
+        try {
+            if (sftp != null && sftp.isConnected()) return;
+
+            if (session != null && session.isConnected()) {
+                try { session.disconnect(); } catch (Exception ignore) {}
+            }
+
+            JSch jsch = new JSch();
+            if (cfg.strictHostKeyChecking) {
+                if (cfg.knownHostsPath != null && !cfg.knownHostsPath.isBlank()) {
+                    jsch.setKnownHosts(cfg.knownHostsPath);
+                } else {
+                    throw new IOException("strictHostKeyChecking=true nhưng chưa cấu hình knownHostsPath");
+                }
+            }
+            if (cfg.privateKeyPath != null && !cfg.privateKeyPath.isBlank()) {
+                if (cfg.privateKeyPassphrase != null && !cfg.privateKeyPassphrase.isBlank()) {
+                    jsch.addIdentity(cfg.privateKeyPath, cfg.privateKeyPassphrase);
+                } else {
+                    jsch.addIdentity(cfg.privateKeyPath);
+                }
+            }
+
+            session = jsch.getSession(cfg.username, cfg.host, cfg.port);
+            if (cfg.password != null && !cfg.password.isBlank()) {
+                session.setPassword(cfg.password);
+            }
+
+            Properties props = new Properties();
+            props.put("StrictHostKeyChecking", cfg.strictHostKeyChecking ? "yes" : "no");
+            session.setConfig(props);
+            session.connect(cfg.connectTimeoutMs);
+
+            Channel ch = session.openChannel("sftp");
+            ch.connect(cfg.connectTimeoutMs);
+            sftp = (ChannelSftp) ch;
+
+        } catch (JSchException e) {
+            throw new IOException("SFTP connect failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** Tạo thư mục (mkdir -p) trên SFTP */
+    public void ensureDir(String remoteDir) throws IOException {
+        connectIfNeeded();
+        try {
+            sftp.cd(remoteDir);
+        } catch (SftpException e) {
+            mkdirs(remoteDir);
+        }
+    }
+
+    public void uploadAtomic(String remoteDir, String fileName, InputStream data) throws IOException {
+        connectIfNeeded();
+        try {
+            sftp.cd(remoteDir);
+            String tmp = fileName + ".tmp";
+            sftp.put(data, tmp);
+            sftp.rename(tmp, fileName);
+        } catch (SftpException e) {
+            throw new IOException("SFTP upload failed: " + e.getMessage(), e);
+        }
+    }
+
+    private void mkdirs(String path) throws IOException {
+        connectIfNeeded();
+        String[] parts = path.split("/");
+        String current = "";
+        try {
+            for (String p : parts) {
+                if (p == null || p.isBlank()) continue;
+                current += "/" + p;
+                try { sftp.cd(current); }
+                catch (SftpException e) { sftp.mkdir(current); }
+            }
+        } catch (SftpException e) {
+            throw new IOException("SFTP mkdirs failed: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void close() {
+        try { if (sftp != null && sftp.isConnected()) sftp.disconnect(); } catch (Exception ignore) {}
+        try { if (session != null && session.isConnected()) session.disconnect(); } catch (Exception ignore) {}
+    }
+}
+
