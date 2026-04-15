@@ -1,0 +1,259 @@
+package org.Amkor.qovor;
+
+import org.Amkor.qovor.impl.*;
+
+
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.Properties;
+import java.util.concurrent.*;
+
+
+
+public class Main {
+    private static String htmlTableToCsv(String html) {
+        String lower = html.toLowerCase();
+        int tStart = lower.indexOf("<table");
+        if (tStart < 0) return "";
+        int tOpenEnd = lower.indexOf('>', tStart);
+        if (tOpenEnd < 0) return "";
+        int tEnd = lower.indexOf("</table>", tOpenEnd);
+        if (tEnd < 0) tEnd = html.length();
+        String table = html.substring(tOpenEnd + 1, tEnd);
+
+
+        table = table.replace("\r", "").replace("\n", "");
+
+        String[] rows = table.split("(?i)</tr>");
+        StringBuilder csv = new StringBuilder();
+
+        for (String row : rows) {
+            int tdStart = row.toLowerCase().indexOf("<tr");
+            if (tdStart >= 0) {
+                int gt = row.indexOf('>', tdStart);
+                row = (gt >= 0) ? row.substring(gt + 1) : row;
+            }
+            String r = row
+                    .replaceAll("(?i)</td>", "</TD>")
+                    .replaceAll("(?i)</th>", "</TH>");
+            String[] cells = r.split("(?i)</TD>|</TH>");
+            StringBuilder line = new StringBuilder();
+            boolean first = true;
+
+            for (String cell : cells) {
+                int openIdx = cell.toLowerCase().indexOf("<td");
+                if (openIdx >= 0) {
+                    int gt = cell.indexOf('>', openIdx);
+                    cell = (gt >= 0) ? cell.substring(gt + 1) : cell;
+                }
+                openIdx = cell.toLowerCase().indexOf("<th");
+                if (openIdx >= 0) {
+                    int gt = cell.indexOf('>', openIdx);
+                    cell = (gt >= 0) ? cell.substring(gt + 1) : cell;
+                }
+                cell = cell.replaceAll("(?i)<br\\s*/?>", "\n");
+                cell = cell.replaceAll("<[^>]+>", ""); // remove any tag
+
+                cell = cell.replace("&nbsp;", " ")
+                        .replace("&amp;", "&")
+                        .replace("&lt;", "<")
+                        .replace("&gt;", ">")
+                        .replace("&quot;", "\"")
+                        .replace("&#39;", "'");
+
+                cell = cell.trim();
+
+                if (cell.contains(",") || cell.contains("\n") || cell.contains("\"")) {
+                    cell = "\"" + cell.replace("\"", "\"\"") + "\"";
+                }
+
+                if (!first) line.append(',');
+                line.append(cell);
+                first = false;
+            }
+
+            String ln = line.toString().trim();
+            if (!ln.isEmpty()) {
+                csv.append(ln).append("\r\n");
+            }
+        }
+        return csv.toString();
+    }
+
+
+    private static String fmt(LocalDateTime dt) {
+        return dt.format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+    }
+
+    //Main
+    public static void main(String[] args) throws Exception {
+        String cfgPath = (args.length > 0) ? args[0] : "config.properties";
+        Properties p = new Properties();
+        try (InputStream in = new FileInputStream(cfgPath)) { p.load(in); }
+
+        String url = p.getProperty("source.url");
+        if (url == null || url.isBlank()) {
+            System.err.println("Missing `source.url` in config.properties");
+            System.exit(1);
+        }
+
+        // Rename (form cố định)
+        String template = p.getProperty("rename.template", "${date:yyyyMMdd}_${original}");
+        TemplateRenameStrategy renamer = new TemplateRenameStrategy(template);
+
+        // HTTP downloader
+        HttpDownloader downloader = new HttpDownloader();
+
+        // SFTP uploader (đơn giản: host/user/pass/path)
+
+        FtpUploader.FtpConfig cfg = new FtpUploader.FtpConfig();
+        cfg.host = p.getProperty("ftp.host");
+        cfg.port = Integer.parseInt(p.getProperty("ftp.port", "21"));
+        cfg.username = p.getProperty("ftp.username");
+        cfg.password = p.getProperty("ftp.password");
+        cfg.remoteDir = p.getProperty("ftp.remoteDir", "/");
+
+        FtpUploader uploader = new FtpUploader(cfg);
+
+
+        Runnable job = () -> {
+            System.out.println("[" + nowStr() + "] Running job: download -> rename -> ftp");
+
+            ZoneId zone = ZoneId.systemDefault();
+            LocalDate today = LocalDate.now(zone);
+
+// 00:00 hôm nay
+            LocalDateTime toDT = today.atTime(0, 0, 0);
+
+// 00:00 hôm qua
+            LocalDateTime fromDT = toDT.minusDays(1);
+
+            String fromStr = fmt(fromDT);
+            String toStr   = fmt(toDT);
+
+            String finalUrl = url
+                    .replace("{FROM}", fromStr)
+                    .replace("{TO}", toStr);
+            System.out.println(finalUrl);
+
+            for (int attempt = 1; attempt <= 2; attempt++) {
+                try (HttpDownloader.Download dl = downloader.open(finalUrl)) {
+                    String targetName = renamer.toTargetName(dl.originalFileName);
+                    if (!targetName.toLowerCase().endsWith(".csv")) {
+                        int dot = targetName.lastIndexOf('.');
+                        targetName = (dot > 0 ? targetName.substring(0, dot) : targetName) + ".csv";
+                    }
+
+                    // 1) Đọc toàn bộ stream HTML vào String (UTF-8)
+                    byte[] htmlBytes = dl.stream.readAllBytes();
+                    String html = new String(htmlBytes, java.nio.charset.StandardCharsets.UTF_8);
+
+                    // 2) Chuyển HTML table -> CSV
+                    String csvText = htmlTableToCsv(html);
+
+                    // 3) Upload CSV
+                    uploader.ensureDir(cfg.remoteDir);
+                    try (InputStream csvStream =
+                                 new java.io.ByteArrayInputStream(csvText.getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+                        uploader.uploadAtomic(cfg.remoteDir, targetName, csvStream);
+
+                    }
+
+                    System.out.println("Uploaded OK (CSV): " + targetName);
+                    // 4) kiểm tra và submit tới sftp khách nếu file tồn tại quá 72h
+                    final String ftpFolderA   = p.getProperty("ftp.check.Yield");
+                    final String ftpFolderB   = p.getProperty("ftp.check.Defect");
+                    final String sftpFolderA  = p.getProperty("sftp.folderYield");
+                    final String sftpFolderB  = p.getProperty("sftp.folderDefect");
+                    final int ageHours        = Integer.parseInt(p.getProperty("move.ageHours", "6"));
+                    final boolean deleteAfter = Boolean.parseBoolean(p.getProperty("move.deleteAfterMove", "true"));
+                    final String ftpBackupA = p.getProperty("ftp.backup.Yield");
+                    final String ftpBackupB = p.getProperty("ftp.backup.Defect");
+
+
+                    final String nameRegex    = p.getProperty("move.nameTime.regex", "(\\d{14})");
+                    final String nameFormat   = p.getProperty("move.nameTime.format", "yyyyMMddHHmmss");
+                    final String nameZone     = p.getProperty("move.nameTime.zone", "Asia/Ho_Chi_Minh");
+                    final String assumeHHmmss = p.getProperty("move.nameTime.assumeTime", "");
+                    final String yearHint = p.getProperty("move.nameTime.yearHint", "");
+
+                    SftpUploader.SftpConfig sftp2Cfg = new SftpUploader.SftpConfig();
+                    sftp2Cfg.host = p.getProperty("sftp.host");
+                    sftp2Cfg.port = Integer.parseInt(p.getProperty("sftp.port", "22"));
+                    sftp2Cfg.username = p.getProperty("sftp.username");
+                    sftp2Cfg.privateKeyPath = p.getProperty("sftp.privateKeyPath");
+                    sftp2Cfg.privateKeyPassphrase = p.getProperty("sftp.privateKeyPassphrase", "");
+                    sftp2Cfg.strictHostKeyChecking = false;
+
+
+                    try (SftpUploader sftp2 = new SftpUploader(sftp2Cfg)) {
+
+                        if (ftpFolderA != null && sftpFolderA != null) {
+                            uploader.moveOldFilesToSftpPairByNameTime(
+                                    sftp2, ftpFolderA, sftpFolderA, ageHours, deleteAfter,
+                                    nameRegex, nameFormat, nameZone, assumeHHmmss, yearHint, ftpBackupA
+                            );
+                        }
+                        if (ftpFolderB != null && sftpFolderB != null) {
+                            uploader.moveOldFilesToSftpPairByNameTime(
+                                    sftp2, ftpFolderB, sftpFolderB, ageHours, deleteAfter,
+                                    nameRegex, nameFormat, nameZone, assumeHHmmss, yearHint, ftpBackupB
+                            );
+                        }
+                    } catch (Exception ex) {
+                        System.err.println("[MOVE] Error when moving old files to SFTP: " + ex);
+                    }
+
+                    return;
+                } catch (Exception e) {
+                    System.err.println("Attempt " + attempt + " failed: " + e);
+                    if (attempt == 2) e.printStackTrace();
+                    try { Thread.sleep(2000); } catch (InterruptedException ignore) {}
+                }
+            }
+        };
+
+        int exit = 0;
+        try {
+            boolean runNow = Boolean.parseBoolean(p.getProperty("test.runNow", "false"));
+            if (runNow) {
+                System.out.println("[TEST] test.runNow=true → run job immediately");
+                job.run();
+            }else {
+                // Lịch: 09:00 sáng hàng ngày theo timezone máy
+                ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "daily-09h"); t.setDaemon(false); return t;
+                });
+
+                long initialDelayMs = millisUntilNextSixAM(ZoneId.systemDefault());
+                long periodMs = TimeUnit.DAYS.toMillis(1);
+
+                exec.scheduleAtFixedRate(job, initialDelayMs, periodMs, TimeUnit.MILLISECONDS);
+
+                System.out.println("Service started. First run at next 09:00. Now: " + nowStr());
+                Thread.currentThread().join();
+            }
+        }catch (Throwable t){
+            t.printStackTrace();
+            exit = 1;
+        }finally {
+            System.out.flush();
+            System.err.flush();
+            System.exit(exit);
+        }
+    }
+
+    private static long millisUntilNextSixAM(ZoneId zone) {
+        ZonedDateTime now = ZonedDateTime.now(zone);
+        ZonedDateTime next = now.withHour(9).withMinute(0).withSecond(0).withNano(0);
+        if (!next.isAfter(now)) next = next.plusDays(1);
+        return Duration.between(now, next).toMillis();
+    }
+
+    private static String nowStr() {
+        return LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+    }
+
+}
